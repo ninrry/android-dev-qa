@@ -1,0 +1,64 @@
+{
+  "app": "应用名称",
+  "package": "com.example.app",
+  "skip_recording": true,
+
+  "setup": {
+    "description": "测试前准备工作",
+    "push_files": [
+      {"local": "test_data/song.mp3", "device": "/sdcard/Music/"}
+    ],
+    "launch": true
+  },
+
+  "screens": [
+    {
+      "id": "home",
+      "name": "首页",
+      "elements": ["首页", "曲库"]
+    }
+  ],
+
+  "scenarios": [
+    {
+      "name": "示例测试场景",
+      "steps": [
+        {"action": "launch", "package": "com.example.app", "wait_after": 3000},
+        {"action": "screenshot", "screenshot_name": "home"},
+        {"action": "tap", "target": "text:曲库", "wait_after": 1000},
+        {"action": "scroll_find", "text": "设置", "direction": "up", "max_scrolls": 5},
+        {"action": "long_press", "target": "text:歌曲名", "duration_ms": 1000},
+        {"action": "type", "text": "测试文本", "clear_first": true},
+        {"action": "element_state", "target": "text:开关", "expect": {"enabled": true, "checked": false}},
+        {"action": "drag", "from": "text:项目A", "to": "text:项目B", "duration_ms": 500},
+        {"action": "double_tap", "target": "500,600"},
+        {"action": "swipe", "direction": "up"},
+        {"action": "back"},
+        {"action": "wait", "duration": 2000},
+        {"action": "screenshot", "screenshot_name": "final", "expect": "预期文字"}
+      ]
+    }
+  ],
+
+  "teardown": {
+    "description": "测试后清理",
+    "force_stop": true
+  },
+
+  "_supported_actions": [
+    "launch — 启动应用 (package, activity)",
+    "tap — 点击 (target: text:/resource:/x,y)",
+    "long_press — 长按 (target, duration_ms)",
+    "double_tap — 双击 (target)",
+    "swipe — 滑动 (direction: up/down/left/right)",
+    "drag — 拖拽 (from, to, duration_ms)",
+    "type — 输入文本 Unicode (text, clear_first)",
+    "scroll_find — 滚动查找 (text, direction, max_scrolls)",
+    "element_state — 验证元素状态 (target, expect: {enabled, checked, selected})",
+    "back — 返回键",
+    "home — Home 键",
+    "wait — 等待 (duration: ms)",
+    "screenshot — 截图 (screenshot_name, expect)",
+    "navigate — 导航到指定界面 (to)"
+  ]
+}

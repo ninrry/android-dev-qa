@@ -1,0 +1,6 @@
+name: android-dev-qa
+description: "通用 Android 开发测试能力工具：UI/动画/功能的自动化测试与智能分析"
+version: "0.1.0"
+author: "ninrry"
+language: python
+tags: [android, testing, qa, automation, ai]
