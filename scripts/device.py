@@ -272,10 +272,10 @@ class DeviceManager:
             addr = f"127.0.0.1:{port}"
             if addr in existing:
                 continue
-            r = self._run(["connect", addr], timeout=5)
+            r = self._run(["connect", addr], timeout=3)
             if r.returncode == 0 and "connected" in r.stdout.lower():
                 logger.info("Auto-connected emulator at %s", addr)
-                time.sleep(0.3)
+                time.sleep(0.2)
                 # Verify it appears in device list
                 for dev in self.list_devices():
                     if dev.serial == addr and dev.ready:

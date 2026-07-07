@@ -88,9 +88,11 @@ class AdbBackend(DeviceBackend):
             devs = self._dm.list_devices()
             dev = next((d for d in devs if d.serial == serial), None)
         else:
-            # Auto-discover: first try auto-connect for third-party emulators
-            self._dm.auto_connect_emulators()
+            # Auto-discover: check existing devices first, only scan if none found
             dev = self._dm.get_ready_device()
+            if not dev:
+                self._dm.auto_connect_emulators()
+                dev = self._dm.get_ready_device()
         if not dev:
             raise RuntimeError("No device found")
         self._serial = dev.serial
