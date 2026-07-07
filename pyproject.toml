@@ -10,6 +10,7 @@ keywords = ["android", "qa", "testing", "automation", "mcp", "adb"]
 
 dependencies = [
     "mcp>=1.0.0,<2.0",
+    "google-genai>=1.0",
 ]
 
 [project.optional-dependencies]

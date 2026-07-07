@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """android-qa-mcp — Universal Android Dev QA MCP Server
 
-Pluggable device control backend (ADB by default) + 31 MCP tools.
+Pluggable device control backend (ADB by default) + built-in vision analysis + 34 MCP tools.
 
 Tools:
   Device:       qa_connect, qa_launch, qa_shell, qa_check_app_alive,
@@ -14,6 +14,7 @@ Tools:
   Performance: qa_measure_startup, qa_dump_meminfo, qa_dump_gfxinfo
   Logging/rec: qa_logcat_start, qa_logcat_stop,
                 qa_recording_start, qa_recording_stop
+  Vision:      qa_analyze_screenshot, qa_analyze_video, qa_analyze_logcat
   Test runner: qa_run_test
 """
 import asyncio
@@ -36,6 +37,8 @@ if SCRIPT_DIR not in sys.path:
 
 from backends import get_backend, DeviceBackend
 from backends.base import DeviceInfo
+from vision import get_vision_engine, VisionEngine
+from analysis import SCREENSHOT_UI_PROMPT, VIDEO_INTERACTION_PROMPT, LOGCAT_PROMPT
 
 logger = logging.getLogger("android-qa")
 logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s: %(message)s")
@@ -367,6 +370,54 @@ def _handle_tool(name: str, arguments: dict) -> dict:
                               encoding="utf-8", errors="replace")
         return {"exit_code": proc.returncode, "stdout": proc.stdout[:2000], "stderr": proc.stderr[:500]}
 
+    # ── qa_analyze_screenshot ─────────────────────────────────────────────
+    if name == "qa_analyze_screenshot":
+        engine = get_vision_engine()
+        if not engine.available:
+            return {"error": "Vision analysis unavailable: no Google API keys configured. Set QA_VISION_API_KEYS or GOOGLE_API_KEY env var."}
+        image_path = arguments.get("image_path", "")
+        custom_prompt = arguments.get("prompt", "")
+        prompt = custom_prompt or SCREENSHOT_UI_PROMPT
+        result = engine.analyze_screenshot(image_path, prompt)
+        if result is None:
+            return {"error": "Analysis failed — check logs for details"}
+        return result
+
+    # ── qa_analyze_video ──────────────────────────────────────────────────
+    if name == "qa_analyze_video":
+        engine = get_vision_engine()
+        if not engine.available:
+            return {"error": "Vision analysis unavailable: no Google API keys configured."}
+        video_path = arguments.get("video_path", "")
+        custom_prompt = arguments.get("prompt", "")
+        prompt = custom_prompt or VIDEO_INTERACTION_PROMPT
+        result = engine.analyze_video(video_path, prompt)
+        if result is None:
+            return {"error": "Analysis failed — check logs for details"}
+        return result
+
+    # ── qa_analyze_logcat ─────────────────────────────────────────────────
+    if name == "qa_analyze_logcat":
+        engine = get_vision_engine()
+        if not engine.available:
+            return {"error": "Vision analysis unavailable: no Google API keys configured."}
+        logcat_path = arguments.get("logcat_path", "")
+        custom_prompt = arguments.get("prompt", "")
+        prompt = custom_prompt or LOGCAT_PROMPT
+        # Read logcat file
+        if not os.path.isfile(logcat_path):
+            return {"error": f"Logcat file not found: {logcat_path}"}
+        try:
+            with open(logcat_path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            excerpt = "".join(lines[-500:])
+        except OSError as e:
+            return {"error": f"Failed to read logcat: {e}"}
+        result = engine.analyze_logcat(excerpt, prompt)
+        if result is None:
+            return {"error": "Analysis failed — check logs for details"}
+        return result
+
     return {"error": f"Unknown tool: {name}"}
 
 
@@ -479,6 +530,12 @@ _TOOL_DEFINITIONS = [
          inputSchema={"type": "object", "properties": {"package": {"type": "string", "description": "应用包名"}}, "required": ["package"]}),
     Tool(name="qa_dump_gfxinfo", description="获取应用帧渲染信息（总帧数/卡顿帧/百分位延迟）。",
          inputSchema={"type": "object", "properties": {"package": {"type": "string", "description": "应用包名"}}, "required": ["package"]}),
+    Tool(name="qa_analyze_screenshot", description="使用 AI 视觉模型分析截图。检测布局问题、文字截断、组件缺陷等。使用 gemma-4-31b-it 模型。",
+         inputSchema={"type": "object", "properties": {"image_path": {"type": "string", "description": "截图文件路径"}, "prompt": {"type": "string", "description": "自定义分析提示词（可选，默认使用内置 UI 检查清单）"}}, "required": ["image_path"]}),
+    Tool(name="qa_analyze_video", description="使用 AI 视觉模型分析测试录屏。检测动画流畅度、交互响应、转场质量等。使用 gemini-3.1-flash-lite 模型。",
+         inputSchema={"type": "object", "properties": {"video_path": {"type": "string", "description": "录屏文件路径"}, "prompt": {"type": "string", "description": "自定义分析提示词（可选，默认使用内置交互检查清单）"}}, "required": ["video_path"]}),
+    Tool(name="qa_analyze_logcat", description="使用 AI 模型分析 logcat 日志。检测崩溃、ANR、性能问题等。使用 gemma-4-31b-it 模型。",
+         inputSchema={"type": "object", "properties": {"logcat_path": {"type": "string", "description": "logcat 日志文件路径"}, "prompt": {"type": "string", "description": "自定义分析提示词（可选，默认使用内置稳定性检查清单）"}}, "required": ["logcat_path"]}),
 ]
 
 # qa_run_test needs subprocess — import it only when used
