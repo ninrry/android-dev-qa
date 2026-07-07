@@ -117,6 +117,52 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 def _handle_tool(name: str, arguments: dict) -> dict:
     """Synchronous tool handler — runs in executor thread."""
+    # ── Vision tools (no device required) ──────────────────────────────────
+    if name in ("qa_analyze_screenshot", "qa_analyze_video", "qa_analyze_logcat"):
+        engine = get_vision_engine()
+        if not engine.available:
+            return {"error": "Vision analysis unavailable: no Google API keys configured. Set QA_VISION_API_KEYS or GOOGLE_API_KEY env var."}
+
+        if name == "qa_analyze_screenshot":
+            image_path = arguments.get("image_path", "")
+            if not os.path.isfile(image_path):
+                return {"error": f"Image file not found: {image_path}"}
+            custom_prompt = arguments.get("prompt", "")
+            prompt = custom_prompt or SCREENSHOT_UI_PROMPT
+            result = engine.analyze_screenshot(image_path, prompt)
+            if result is None:
+                return {"error": "Analysis failed — check logs for details"}
+            return result
+
+        if name == "qa_analyze_video":
+            video_path = arguments.get("video_path", "")
+            if not os.path.isfile(video_path):
+                return {"error": f"Video file not found: {video_path}"}
+            custom_prompt = arguments.get("prompt", "")
+            prompt = custom_prompt or VIDEO_INTERACTION_PROMPT
+            result = engine.analyze_video(video_path, prompt)
+            if result is None:
+                return {"error": "Analysis failed — check logs for details"}
+            return result
+
+        if name == "qa_analyze_logcat":
+            logcat_path = arguments.get("logcat_path", "")
+            custom_prompt = arguments.get("prompt", "")
+            prompt = custom_prompt or LOGCAT_PROMPT
+            if not os.path.isfile(logcat_path):
+                return {"error": f"Logcat file not found: {logcat_path}"}
+            try:
+                with open(logcat_path, encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                excerpt = "".join(lines[-500:])
+            except OSError as e:
+                return {"error": f"Failed to read logcat: {e}"}
+            result = engine.analyze_logcat(excerpt, prompt)
+            if result is None:
+                return {"error": "Analysis failed — check logs for details"}
+            return result
+
+    # ── Device tools (require backend + connected device) ──────────────────
     _ensure_backend()
     _cleanup_old_files()  # lightweight sweep on each call
     b = _backend
@@ -369,54 +415,6 @@ def _handle_tool(name: str, arguments: dict) -> dict:
         proc = subprocess.run(cmd, capture_output=True, timeout=300,
                               encoding="utf-8", errors="replace")
         return {"exit_code": proc.returncode, "stdout": proc.stdout[:2000], "stderr": proc.stderr[:500]}
-
-    # ── qa_analyze_screenshot ─────────────────────────────────────────────
-    if name == "qa_analyze_screenshot":
-        engine = get_vision_engine()
-        if not engine.available:
-            return {"error": "Vision analysis unavailable: no Google API keys configured. Set QA_VISION_API_KEYS or GOOGLE_API_KEY env var."}
-        image_path = arguments.get("image_path", "")
-        custom_prompt = arguments.get("prompt", "")
-        prompt = custom_prompt or SCREENSHOT_UI_PROMPT
-        result = engine.analyze_screenshot(image_path, prompt)
-        if result is None:
-            return {"error": "Analysis failed — check logs for details"}
-        return result
-
-    # ── qa_analyze_video ──────────────────────────────────────────────────
-    if name == "qa_analyze_video":
-        engine = get_vision_engine()
-        if not engine.available:
-            return {"error": "Vision analysis unavailable: no Google API keys configured."}
-        video_path = arguments.get("video_path", "")
-        custom_prompt = arguments.get("prompt", "")
-        prompt = custom_prompt or VIDEO_INTERACTION_PROMPT
-        result = engine.analyze_video(video_path, prompt)
-        if result is None:
-            return {"error": "Analysis failed — check logs for details"}
-        return result
-
-    # ── qa_analyze_logcat ─────────────────────────────────────────────────
-    if name == "qa_analyze_logcat":
-        engine = get_vision_engine()
-        if not engine.available:
-            return {"error": "Vision analysis unavailable: no Google API keys configured."}
-        logcat_path = arguments.get("logcat_path", "")
-        custom_prompt = arguments.get("prompt", "")
-        prompt = custom_prompt or LOGCAT_PROMPT
-        # Read logcat file
-        if not os.path.isfile(logcat_path):
-            return {"error": f"Logcat file not found: {logcat_path}"}
-        try:
-            with open(logcat_path, encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-            excerpt = "".join(lines[-500:])
-        except OSError as e:
-            return {"error": f"Failed to read logcat: {e}"}
-        result = engine.analyze_logcat(excerpt, prompt)
-        if result is None:
-            return {"error": "Analysis failed — check logs for details"}
-        return result
 
     return {"error": f"Unknown tool: {name}"}
 
