@@ -195,7 +195,12 @@ def _handle_tool(name: str, arguments: dict) -> dict:
         result = {"screenshot": path, "hint": f"将 screenshot 路径直接传给 qa_analyze_screenshot 的 image_path 参数即可进行 AI 视觉分析"}
         if with_layout:
             layout = b.layout_dump()
-            result["elements"] = [{"text": e.text, "center": f"{e.center_x},{e.center_y}"} for e in layout if e.text]
+            result["elements"] = [
+                {"text": e.text, "center": f"{e.center_x},{e.center_y}",
+                 "clickable": e.clickable, "bounds": e.bounds,
+                 "resource_id": e.resource_id}
+                for e in layout if e.text or e.clickable
+            ]
         return result
 
     # ── qa_layout_dump ──────────────────────────────────────────────────

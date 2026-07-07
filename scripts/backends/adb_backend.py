@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from typing import Optional
 
@@ -205,18 +206,196 @@ class AdbBackend(DeviceBackend):
 
     def layout_dump(self) -> list[ElementInfo]:
         layout_path = self._screencap.capture_layout(self._s, f"layout_{int(time.time())}")
-        try:
-            with open(layout_path) as f:
-                data = json.load(f)
-            return [self._parse_element(e) for e in data]
-        except Exception as e:
-            logger.error("layout_dump failed: %s", e)
+        if not layout_path or not os.path.exists(layout_path):
+            logger.error("layout_dump: no layout file")
             return []
+
+        # Try JSON first (android CLI output), then XML (uiautomator dump)
+        if layout_path.endswith(".json"):
+            try:
+                with open(layout_path) as f:
+                    data = json.load(f)
+                raw = [self._parse_element(e) for e in data]
+                merged = self._merge_interactive_with_text(raw)
+                return self._enrich_elements(merged)
+            except Exception as e:
+                logger.error("layout_dump JSON parse failed: %s", e)
+                return []
+
+        # XML from uiautomator dump
+        try:
+            return self._parse_xml_layout(layout_path)
+        except Exception as e:
+            logger.error("layout_dump XML parse failed: %s", e)
+            return []
+
+    def _parse_xml_layout(self, xml_path: str) -> list[ElementInfo]:
+        """Parse uiautomator XML dump and enrich with parent text propagation.
+
+        Compose apps separate text nodes from clickable parent nodes.
+        This method propagates child text to the nearest clickable ancestor,
+        so find_element("text:X") returns the clickable region, not the bare text.
+        """
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+
+        # Step 1: Parse all nodes with raw attributes
+        nodes: list[dict] = []
+        for elem in root.iter():
+            a = elem.attrib
+            bounds = a.get("bounds", "")
+            cx, cy = 0, 0
+            if bounds:
+                m = re.findall(r"\[(\d+),(\d+)\]", bounds)
+                if len(m) == 2:
+                    cx = (int(m[0][0]) + int(m[1][0])) // 2
+                    cy = (int(m[0][1]) + int(m[1][1])) // 2
+            nodes.append({
+                "text": a.get("text", ""),
+                "resource_id": a.get("resource-id", ""),
+                "class_name": a.get("class", ""),
+                "bounds": bounds,
+                "center_x": cx,
+                "center_y": cy,
+                "clickable": a.get("clickable") == "true",
+                "enabled": a.get("enabled", "true") == "true",
+                "checked": a.get("checked") == "true",
+                "selected": a.get("selected") == "true",
+                "scrollable": a.get("scrollable") == "true",
+                "focusable": a.get("focusable") == "true",
+                # Track parent index for text propagation
+                "parent_idx": -1,
+                "children_text": [],
+            })
+
+        # Step 2: Build parent-child mapping via tree walk
+        idx = 0
+        for elem in root.iter():
+            if idx >= len(nodes):
+                break
+            # Find children of this element
+            child_idx = idx + 1
+            for child in elem:
+                if child_idx < len(nodes):
+                    nodes[child_idx]["parent_idx"] = idx
+                    child_idx += 1
+            idx += 1
+
+        # Step 3: Propagate text from children to clickable ancestors
+        for i, node in enumerate(nodes):
+            if node["text"] and not node["clickable"]:
+                # Walk up to find the nearest clickable ancestor
+                pidx = node["parent_idx"]
+                while pidx >= 0:
+                    parent = nodes[pidx]
+                    if parent["clickable"] and node["text"] not in parent.get("children_text", []):
+                        parent.setdefault("children_text", []).append(node["text"])
+                        break
+                    pidx = parent["parent_idx"]
+
+        # Step 4: Build ElementInfo list — prefer enriched clickable elements
+        result: list[ElementInfo] = []
+        for node in nodes:
+            # For clickable elements: merge children text
+            effective_text = node["text"]
+            if node["clickable"] and node.get("children_text"):
+                # Use first child text as primary label if parent has no text
+                if not effective_text:
+                    effective_text = node["children_text"][0]
+                # Store all child texts for matching
+                node["all_texts"] = [effective_text] + [t for t in node["children_text"] if t != effective_text]
+
+            info = ElementInfo(
+                text=effective_text,
+                resource_id=node["resource_id"],
+                class_name=node["class_name"],
+                bounds=node["bounds"],
+                center_x=node["center_x"],
+                center_y=node["center_y"],
+                clickable=node["clickable"],
+                enabled=node["enabled"],
+                checked=node["checked"],
+                selected=node["selected"],
+                scrollable=node["scrollable"],
+                focusable=node["focusable"],
+            )
+            # Attach extra texts for matching
+            if node.get("all_texts"):
+                info._all_texts = node["all_texts"]  # type: ignore[attr-defined]
+            result.append(info)
+
+        return self._enrich_elements(result)
+
+    @staticmethod
+    def _merge_interactive_with_text(elements: list[ElementInfo]) -> list[ElementInfo]:
+        """Merge interactive nodes with nearby text nodes (Compose layout pattern).
+
+        Android CLI returns separate entries for clickable regions and text labels.
+        A clickable node at (405,2314) with no text often pairs with a text node
+        "翻译" at (405,2368). We match by x-coordinate proximity and merge.
+        """
+        interactive = [e for e in elements if e.clickable and not e.text]
+        text_nodes = [e for e in elements if e.text and not e.clickable]
+
+        if not interactive or not text_nodes:
+            return elements
+
+        matched = set()  # indices into text_nodes that are already paired
+        for ielem in interactive:
+            best_pos = -1
+            best_dist = float("inf")
+            for pos, telem in enumerate(text_nodes):
+                if pos in matched:
+                    continue
+                dx = abs(ielem.center_x - telem.center_x)
+                dy = abs(ielem.center_y - telem.center_y)
+                if dx < 60 and dy < 200:
+                    dist = dx + dy
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_pos = pos
+            if best_pos >= 0:
+                telem = text_nodes[best_pos]
+                ielem.text = telem.text
+                ielem._all_texts = [telem.text]  # type: ignore[attr-defined]
+                matched.add(best_pos)
+
+        return elements
+
+    @staticmethod
+    def _enrich_elements(elements: list[ElementInfo]) -> list[ElementInfo]:
+        """Post-process: filter out empty/useless elements, deduplicate."""
+        enriched = []
+        seen_bounds = set()
+        for e in elements:
+            # Skip elements with no bounds and no text
+            if not e.bounds and not e.text:
+                continue
+            # Skip exact duplicate bounds (common in Compose overlays)
+            key = (e.bounds, e.text)
+            if e.bounds and key in seen_bounds:
+                continue
+            if e.bounds:
+                seen_bounds.add(key)
+            enriched.append(e)
+        return enriched
 
     def find_element(self, text: str = "", resource_id: str = "") -> Optional[ElementInfo]:
         elements = self.layout_dump()
+        # First pass: prefer clickable elements that match
+        for el in elements:
+            if text and text in el.text and el.clickable:
+                return el
+            if resource_id and resource_id in el.resource_id and el.clickable:
+                return el
+        # Second pass: match by text including propagated _all_texts
         for el in elements:
             if text and text in el.text:
+                return el
+            # Check propagated child texts on clickable elements
+            all_texts = getattr(el, "_all_texts", [])
+            if text and any(text in t for t in all_texts):
                 return el
             if resource_id and resource_id in el.resource_id:
                 return el
@@ -325,28 +504,44 @@ class AdbBackend(DeviceBackend):
 
     @staticmethod
     def _parse_element(e: dict) -> ElementInfo:
+        # Support both uiautomator XML format and android CLI JSON format
         bounds = e.get("bounds", "")
         cx, cy = 0, 0
-        if bounds:
-            try:
-                import re
-                m = re.findall(r"\[(\d+),(\d+)\]", bounds)
-                if len(m) == 2:
-                    cx = (int(m[0][0]) + int(m[1][0])) // 2
-                    cy = (int(m[0][1]) + int(m[1][1])) // 2
-            except Exception:
-                pass
+
+        # Parse center — android CLI uses "center": "[x,y]" string
+        center_str = e.get("center", "")
+        if center_str:
+            m = re.findall(r"(\d+)", center_str)
+            if len(m) >= 2:
+                cx, cy = int(m[0]), int(m[1])
+
+        # Parse bounds — compute center from bounds if center not available
+        if bounds and not cx and not cy:
+            m = re.findall(r"\[(\d+),(\d+)\]", bounds)
+            if len(m) == 2:
+                cx = (int(m[0][0]) + int(m[1][0])) // 2
+                cy = (int(m[0][1]) + int(m[1][1])) // 2
+
+        # Parse interactions — android CLI uses ["clickable","focusable",...]
+        interactions = e.get("interactions", [])
+        is_clickable = e.get("clickable", False) or "clickable" in interactions
+        is_scrollable = e.get("scrollable", False) or "scrollable" in interactions
+        is_focusable = e.get("focusable", False) or "focusable" in interactions
+
+        # Parse text — prefer "text", fallback to "content-desc"
+        text = e.get("text", "") or e.get("content-desc", "")
+
         return ElementInfo(
-            text=e.get("text", ""),
-            resource_id=e.get("resource_id", ""),
-            class_name=e.get("class_name", ""),
+            text=text,
+            resource_id=e.get("resource_id", "") or e.get("resource-id", ""),
+            class_name=e.get("class_name", "") or e.get("class", ""),
             bounds=bounds,
             center_x=e.get("center_x", cx),
             center_y=e.get("center_y", cy),
-            clickable=e.get("clickable", False),
+            clickable=is_clickable,
             enabled=e.get("enabled", True),
             checked=e.get("checked", False),
             selected=e.get("selected", False),
-            scrollable=e.get("scrollable", False),
-            focusable=e.get("focusable", False),
+            scrollable=is_scrollable,
+            focusable=is_focusable,
         )
