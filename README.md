@@ -1,17 +1,39 @@
 # android-dev-qa
 
-Universal Android device control & QA toolkit — MCP server, pluggable backends, AI analysis.
+Universal Android device control & QA toolkit — MCP server, pluggable backends, AI vision analysis.
+
+## Version History
+
+### v0.3.0 (2026-07-07)
+- Fix Compose layout coordinate resolution — merge text + clickable nodes by proximity
+- Fix qa_connect fast path — skip port scan when devices already visible in adb devices
+- Fix MCP timeout — raised from 10s to 60s for AI analysis calls
+- Fix path hint — qa_screenshot returns hint for direct analyze_screenshot workflow
+- Add android CLI JSON format parsing (interactions, center, content-desc)
+- Add _merge_interactive_with_text — position-based text-to-clickable merge for Compose apps
+- Add _parse_xml_layout — uiautomator XML dump with parent-child text propagation
+- qa_screenshot returns full element info (clickable, bounds, resource_id)
+- find_element prefers clickable matches first
+
+### v0.2.0 (2026-07-06)
+- Add built-in vision analysis engine — direct Google AI API (no LiteLLM proxy)
+- qa_analyze_screenshot / qa_analyze_video / qa_analyze_logcat tools
+- Multi API key rotation (KEY2/4/6), vision tools bypass device check
+- No global lock — tools run concurrently via asyncio executor
+
+### v0.1.0
+- Initial release — 31 MCP tools, pluggable backends, cross-platform ADB
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  Agent (Hermes / Claude / any MCP client)       │
+│  Agent (Hermes / OpenCode / any MCP client)     │
 │  calls qa_* tools via MCP protocol              │
 └──────────────┬──────────────────────────────────┘
                │
 ┌──────────────▼──────────────────────────────────┐
-│  mcp_server.py  (31 tools, no global lock)      │
+│  mcp_server.py  (35 tools, no global lock)      │
 │  Routes to DeviceBackend protocol               │
 └──────────────┬──────────────────────────────────┘
                │
@@ -28,6 +50,7 @@ Universal Android device control & QA toolkit — MCP server, pluggable backends
 │  ├── screencap.py    (Screenshot + layout)      │
 │  ├── recorder.py     (Screen recording)         │
 │  ├── logcat_capture.py (Logcat + crash detect)  │
+│  ├── vision/         (AI vision analysis)       │
 │  ├── analysis/       (AI prompts + result merge)│
 │  └── runner.py       (Test plan runner)         │
 └─────────────────────────────────────────────────┘
@@ -46,7 +69,7 @@ pip install -e ".[dev]"
 
 ### 2. Configure Agent
 
-Add to your MCP client config (e.g. Hermes `config.yaml`):
+**Hermes** (`config.yaml`):
 
 ```yaml
 android-qa:
@@ -56,6 +79,22 @@ android-qa:
   timeout: 120
 ```
 
+**OpenCode** (`opencode.json`, WSL):
+
+```json
+{
+  "mcp": {
+    "android-qa": {
+      "command": ["wsl", "-e", "/path/to/android-dev-qa/.venv/bin/python3", "/path/to/android-dev-qa/mcp_server.py"],
+      "timeout": 60000,
+      "environment": {
+        "QA_VISION_API_KEYS": "key1,key2,..."
+      }
+    }
+  }
+}
+```
+
 ### 3. Environment Variables
 
 | Variable | Purpose | Default |
@@ -63,19 +102,47 @@ android-qa:
 | `ADB_PATH` | Path to `adb` binary | Auto-discovered |
 | `ANDROID_HOME` | Android SDK root | Auto-discovered |
 | `QA_BACKEND` | Backend name (`adb`, future: `scrcpy`) | `adb` |
+| `QA_VISION_API_KEYS` | Google AI API keys (comma-separated) | — |
+| `QA_VISION_IMAGE_MODEL` | Image analysis model | `gemma-4-31b-it` |
+| `QA_VISION_VIDEO_MODEL` | Video analysis model | `gemini-3.1-flash-lite` |
 | `WINDOWS_USER` | Windows username (WSL only) | Auto-detected |
 
 ### 4. Connect & Use
 
 ```
 qa_connect                → Auto-discover device
-qa_screenshot             → Capture screen
-qa_tap target="text:Settings"  → Tap by text
+qa_screenshot             → Capture screen + layout elements
+qa_tap target="text:Settings"  → Tap by text (Compose-aware)
 qa_tap target="500,800"        → Tap by coordinates
 qa_type text="hello"           → Type text
 qa_scroll_find text="Submit"   → Scroll until found
+qa_analyze_screenshot image_path="/path/to/screenshot.png"  → AI vision analysis
 qa_run_test test_plan_path="plan.json"  → Run test suite
 ```
+
+## Compose Layout Support
+
+Jetpack Compose apps separate text nodes from clickable regions in the UI hierarchy.
+This toolkit automatically merges them by coordinate proximity:
+
+1. Parse android CLI JSON or uiautomator XML layout dump
+2. Identify clickable nodes (no text) and text nodes (no clickable flag)
+3. Match by position: dx < 60px, dy < 200px
+4. Merge text into clickable region so `find_element("text:X")` returns the clickable area
+
+This means `qa_tap target="text:翻译"` correctly hits the button's clickable center,
+not the text label's center.
+
+## AI Vision Analysis
+
+Built-in Google AI API integration for screenshot/video/logcat analysis:
+
+- **qa_analyze_screenshot** — UI layout issues, text truncation, component defects (gemma-4-31b-it)
+- **qa_analyze_video** — animation fluidity, interaction response, transition quality (gemini-3.1-flash-lite)
+- **qa_analyze_logcat** — crash detection, ANR, performance issues (gemma-4-31b-it)
+
+Multi API key rotation with automatic dead-key detection at startup.
+Vision tools work without device connection — pass local file paths directly.
 
 ## Backends
 
@@ -101,20 +168,6 @@ Emulator type detection: AVD, Genymotion, BlueStacks, LDPlayer.
    ```
 5. Set `QA_BACKEND=your_backend`
 
-## AI Analysis (Optional)
-
-The `analysis/` module provides prompt templates and result merging for:
-- **Screenshot UI analysis** — layout, text, component issues
-- **Video interaction analysis** — animations, transitions, responsiveness
-- **Logcat stability analysis** — crashes, ANRs, OOMs
-
-AI calls are NOT made by the MCP server itself. Instead:
-1. `qa_run_test` generates an `analysis_manifest.json`
-2. The agent reads the manifest and calls its own vision/LLM tools
-3. Results are fed back through `AIAnalyzer.merge_results()`
-
-This keeps the MCP server agent-agnostic.
-
 ## Test Plans
 
 See `templates/test_plan.json` for the full schema. Supported actions:
@@ -134,15 +187,6 @@ See `templates/test_plan.json` for the full schema. Supported actions:
 | `back` / `home` | Navigation keys |
 | `wait` | Delay |
 | `screenshot` | Capture + optional expect |
-
-## Changes from v0.1.0
-
-- **No global lock**: Tools run concurrently via asyncio executor
-- **Pluggable backends**: Swap ADB for Scrcpy/Appium without code changes
-- **Cross-platform ADB**: Auto-discovers on WSL/macOS/Linux/Windows
-- **Unified analysis**: `analyzer.py` + `ai_analysis.py` merged into `analysis/`
-- **Clipboard fix**: Multi-method fallback (am broadcast → service call → ADBKeyboard)
-- **Unicode input**: Clipboard + paste strategy for CJK on Android 14+
 
 ## License
 

@@ -1,6 +1,6 @@
 [project]
 name = "android-dev-qa"
-version = "0.2.0"
+version = "0.3.0"
 description = "Universal Android device control & QA toolkit — MCP server, pluggable backends, AI analysis"
 readme = "README.md"
 license = "MIT"
