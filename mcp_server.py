@@ -192,7 +192,7 @@ def _handle_tool(name: str, arguments: dict) -> dict:
         sname = arguments.get("name", f"screenshot_{int(time.time())}")
         with_layout = arguments.get("with_layout", True)
         path = b.screenshot(sname)
-        result = {"screenshot": path}
+        result = {"screenshot": path, "hint": f"将 screenshot 路径直接传给 qa_analyze_screenshot 的 image_path 参数即可进行 AI 视觉分析"}
         if with_layout:
             layout = b.layout_dump()
             result["elements"] = [{"text": e.text, "center": f"{e.center_x},{e.center_y}"} for e in layout if e.text]
@@ -528,7 +528,7 @@ _TOOL_DEFINITIONS = [
          inputSchema={"type": "object", "properties": {"package": {"type": "string", "description": "应用包名"}}, "required": ["package"]}),
     Tool(name="qa_dump_gfxinfo", description="获取应用帧渲染信息（总帧数/卡顿帧/百分位延迟）。",
          inputSchema={"type": "object", "properties": {"package": {"type": "string", "description": "应用包名"}}, "required": ["package"]}),
-    Tool(name="qa_analyze_screenshot", description="使用 AI 视觉模型分析截图。检测布局问题、文字截断、组件缺陷等。使用 gemma-4-31b-it 模型。",
+    Tool(name="qa_analyze_screenshot", description="使用 AI 视觉模型分析截图。检测布局问题、文字截断、组件缺陷等。使用 gemma-4-31b-it 模型。image_path 可直接传入 qa_screenshot 返回的 screenshot 字段值（两者在同一 WSL 进程内共享路径）。",
          inputSchema={"type": "object", "properties": {"image_path": {"type": "string", "description": "截图文件路径"}, "prompt": {"type": "string", "description": "自定义分析提示词（可选，默认使用内置 UI 检查清单）"}}, "required": ["image_path"]}),
     Tool(name="qa_analyze_video", description="使用 AI 视觉模型分析测试录屏。检测动画流畅度、交互响应、转场质量等。使用 gemini-3.1-flash-lite 模型。",
          inputSchema={"type": "object", "properties": {"video_path": {"type": "string", "description": "录屏文件路径"}, "prompt": {"type": "string", "description": "自定义分析提示词（可选，默认使用内置交互检查清单）"}}, "required": ["video_path"]}),
