@@ -146,23 +146,54 @@ class Device:
 # ── Emulator Detection ────────────────────────────────────────────────────────
 
 _EMULATOR_PATTERNS: dict[str, re.Pattern] = {
-    "avd": re.compile(r"emulator-\d+"),
-    "genymotion": re.compile(r"169\.254\.\d+\.\d+|vbox\d+"),
-    "bluestacks": re.compile(r"127\.0\.0\.1:\d+|bluestacks", re.IGNORECASE),
-    "ldplayer": re.compile(r"127\.0\.0\.1:\d+|ldplayer", re.IGNORECASE),
+    "avd": re.compile(r"^emulator-\d+$"),
+    "genymotion": re.compile(r"^169\.254\.\d+\.\d+$|^vbox\d+$"),
+    "bluestacks": re.compile(r"bluestacks", re.IGNORECASE),
+    "ldplayer": re.compile(r"ldplayer", re.IGNORECASE),
+    "mumu": re.compile(r"mumu|MuMuPlayer", re.IGNORECASE),
+    "nox": re.compile(r"nox|NoxPlayer", re.IGNORECASE),
+}
+
+# TCP-connected emulators default ADB ports
+_EMULATOR_PORTS: dict[str, list[int]] = {
+    "ldplayer": [5555, 5556, 5557, 5558, 62001, 62025, 62026],
+    "bluestacks": [5555, 5565, 5575, 5585],
+    "mumu": [7555],
+    "nox": [62001, 62025, 62026],
 }
 
 
 def _detect_emulator_type(serial: str) -> tuple[bool, str]:
-    """Detect emulator type from serial number."""
+    """Detect emulator type from serial number.
+
+    Strategy:
+    1. Match known name patterns in serial (e.g. 'ldplayer', 'bluestacks')
+    2. Match standard format (emulator-N, 169.254.x.x)
+    3. For 127.0.0.1:PORT, infer type from well-known ports
+    4. Fallback: any TCP address = unknown emulator
+    """
+    # 1. Name-based detection (most reliable)
     for etype, pattern in _EMULATOR_PATTERNS.items():
         if pattern.search(serial):
             return True, etype
-    # Common emulator port ranges (5554+, for AVD)
-    if re.match(r"emulator-\d+", serial):
+
+    # 2. Standard AVD format
+    if re.match(r"^emulator-\d+$", serial):
         return True, "avd"
-    if re.match(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+", serial):
+
+    # 3. TCP address — try to infer from port
+    tcp_match = re.match(r"^127\.0\.0\.1:(\d+)$", serial)
+    if tcp_match:
+        port = int(tcp_match.group(1))
+        for etype, ports in _EMULATOR_PORTS.items():
+            if port in ports:
+                return True, etype
         return True, "unknown"  # TCP-connected, likely emulator
+
+    # 4. 169.254.x.x = Genymotion
+    if re.match(r"^169\.254\.\d+\.\d+$", serial):
+        return True, "genymotion"
+
     return False, ""
 
 
@@ -219,6 +250,39 @@ class DeviceManager:
                 is_emulator=is_emu, emulator_type=emu_type,
             ))
         return devices
+
+    def auto_connect_emulators(self) -> list[Device]:
+        """Try adb connect for known emulator ports.
+
+        Third-party emulators (LDPlayer, BlueStacks, MuMu, Nox) expose ADB
+        on 127.0.0.1:PORT but don't always show up in `adb devices` until
+        explicitly connected. This method attempts common ports.
+
+        Returns list of newly connected devices.
+        """
+        existing = {d.serial for d in self.list_devices()}
+        newly_connected: list[Device] = []
+
+        # Collect all candidate ports
+        candidate_ports: set[int] = set()
+        for ports in _EMULATOR_PORTS.values():
+            candidate_ports.update(ports)
+
+        for port in sorted(candidate_ports):
+            addr = f"127.0.0.1:{port}"
+            if addr in existing:
+                continue
+            r = self._run(["connect", addr], timeout=5)
+            if r.returncode == 0 and "connected" in r.stdout.lower():
+                logger.info("Auto-connected emulator at %s", addr)
+                time.sleep(0.3)
+                # Verify it appears in device list
+                for dev in self.list_devices():
+                    if dev.serial == addr and dev.ready:
+                        newly_connected.append(dev)
+                        break
+
+        return newly_connected
 
     def get_ready_device(self) -> Optional[Device]:
         for dev in self.list_devices():

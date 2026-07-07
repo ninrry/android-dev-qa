@@ -82,9 +82,14 @@ class AdbBackend(DeviceBackend):
 
     def connect(self, serial: Optional[str] = None) -> DeviceInfo:
         if serial:
+            # Explicit serial — try adb connect first for TCP addresses
+            if ":" in serial:
+                self._dm._run(["connect", serial], timeout=5)
             devs = self._dm.list_devices()
             dev = next((d for d in devs if d.serial == serial), None)
         else:
+            # Auto-discover: first try auto-connect for third-party emulators
+            self._dm.auto_connect_emulators()
             dev = self._dm.get_ready_device()
         if not dev:
             raise RuntimeError("No device found")

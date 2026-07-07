@@ -32,11 +32,44 @@ class TestEmulatorDetection(unittest.TestCase):
         self.assertFalse(is_emu)
         self.assertEqual(etype, "")
 
-    def test_tcp_device(self):
+    def test_tcp_device_unknown(self):
         from device import _detect_emulator_type
+        # Non-127.0.0.1 TCP address (e.g. wireless ADB) — NOT necessarily emulator
         is_emu, etype = _detect_emulator_type("192.168.1.100:5555")
+        self.assertFalse(is_emu)  # Remote TCP = could be physical device
+        self.assertEqual(etype, "")
+
+    def test_ldplayer_by_port(self):
+        from device import _detect_emulator_type
+        # LDPlayer default port 62001
+        is_emu, etype = _detect_emulator_type("127.0.0.1:62001")
         self.assertTrue(is_emu)
-        self.assertEqual(etype, "unknown")
+        self.assertEqual(etype, "ldplayer")
+
+    def test_mumu_by_port(self):
+        from device import _detect_emulator_type
+        # MuMu default port 7555
+        is_emu, etype = _detect_emulator_type("127.0.0.1:7555")
+        self.assertTrue(is_emu)
+        self.assertEqual(etype, "mumu")
+
+    def test_bluestacks_by_name(self):
+        from device import _detect_emulator_type
+        is_emu, etype = _detect_emulator_type("127.0.0.1:5565_bluestacks")
+        self.assertTrue(is_emu)
+        self.assertEqual(etype, "bluestacks")
+
+    def test_ldplayer_by_name(self):
+        from device import _detect_emulator_type
+        is_emu, etype = _detect_emulator_type("ldplayer-0")
+        self.assertTrue(is_emu)
+        self.assertEqual(etype, "ldplayer")
+
+    def test_nox_by_name(self):
+        from device import _detect_emulator_type
+        is_emu, etype = _detect_emulator_type("nox_1")
+        self.assertTrue(is_emu)
+        self.assertEqual(etype, "nox")
 
 
 class TestADBDiscovery(unittest.TestCase):
