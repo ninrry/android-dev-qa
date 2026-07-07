@@ -1,0 +1,43 @@
+[project]
+name = "android-dev-qa"
+version = "0.2.0"
+description = "Universal Android device control & QA toolkit — MCP server, pluggable backends, AI analysis"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "ninrry" }]
+keywords = ["android", "qa", "testing", "automation", "mcp", "adb"]
+
+dependencies = [
+    "mcp>=1.0.0,<2.0",
+]
+
+[project.optional-dependencies]
+analysis = [
+    "google-genai>=1.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+android-qa-mcp = "mcp_server:run"
+
+[tool.pytest.ini_options]
+pythonpath = ["scripts"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.backends"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]

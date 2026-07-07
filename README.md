@@ -1,73 +1,148 @@
-# Android Dev QA 🤖
+# android-dev-qa
 
-**通用 Android 开发测试能力工具**
+Universal Android device control & QA toolkit — MCP server, pluggable backends, AI analysis.
 
-通过截图 + 视频 + 日志三维度，对任意 Android 应用进行自动化 UI/动画/功能测试与智能分析。
+## Architecture
 
-## 核心特性
+```
+┌─────────────────────────────────────────────────┐
+│  Agent (Hermes / Claude / any MCP client)       │
+│  calls qa_* tools via MCP protocol              │
+└──────────────┬──────────────────────────────────┘
+               │
+┌──────────────▼──────────────────────────────────┐
+│  mcp_server.py  (31 tools, no global lock)      │
+│  Routes to DeviceBackend protocol               │
+└──────────────┬──────────────────────────────────┘
+               │
+┌──────────────▼──────────────────────────────────┐
+│  backends/                                      │
+│  ├── base.py       (DeviceBackend ABC)          │
+│  ├── adb_backend.py (ADB — default)             │
+│  └── (future: scrcpy, appium, ...)              │
+└──────────────┬──────────────────────────────────┘
+               │
+┌──────────────▼──────────────────────────────────┐
+│  scripts/                                       │
+│  ├── device.py       (ADB auto-discovery)       │
+│  ├── screencap.py    (Screenshot + layout)      │
+│  ├── recorder.py     (Screen recording)         │
+│  ├── logcat_capture.py (Logcat + crash detect)  │
+│  ├── analysis/       (AI prompts + result merge)│
+│  └── runner.py       (Test plan runner)         │
+└─────────────────────────────────────────────────┘
+```
 
-- 📸 **截图分析** — UI 布局、组件形状、文字显示、对齐检查
-- 🎬 **视频分析** — 交互动画、界面切换、过渡效果、响应延迟
-- 📋 **日志分析** — crash、ANR、OOM、异常警告实时检测
-- 🧠 **AI 驱动** — Gemini 语义理解（非像素对比），发现真实问题
-- 📊 **统一报告** — Markdown 格式，截图证据 + 日志摘要 + Bug 列表
+## Quick Start
 
-## 快速开始
+### 1. Install
 
 ```bash
-# 1. 确保设备连接
-adb devices
-
-# 2. 编辑测试计划
-cp templates/test_plan.json output/my_app_plan.json
-# 按照你的应用界面和交互流程编辑
-
-# 3. 运行
-cd scripts
-python runner.py ../output/my_app_plan.json
-
-# 4. 查看报告
-cat ../output/run_*/report.md
+cd android-dev-qa
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
 ```
 
-## 架构
+### 2. Configure Agent
 
-```
-Planning → test_plan.json（界面/转场/弹出/场景定义）
-    ↓
-Execution → ADB 驱动操作 + 录屏 + 截图 + UI dump + logcat
-    ↓
-Analysis → Gemini 截图语义分析 + 视频动画分析 + 日志异常检测
-    ↓
-Report → 预期vs实际比对 → 统一 QA 报告
-```
+Add to your MCP client config (e.g. Hermes `config.yaml`):
 
-## 项目结构
-
-```
-android-dev-qa/
-├── scripts/
-│   ├── runner.py           # 主控编排（入口）
-│   ├── device.py           # ADB 设备管理
-│   ├── recorder.py         # 录屏管理
-│   ├── screencap.py        # 截图 + 布局 dump
-│   ├── logcat_capture.py   # 日志捕获
-│   ├── analyzer.py         # Gemini 分析 prompt
-│   └── reporter.py         # 报告生成
-├── templates/
-│   └── test_plan.json      # 测试计划模板
-├── output/                 # 测试输出（gitignored）
-├── project.yaml
-├── AGENTS.md
-└── README.md
+```yaml
+android-qa:
+  command: /path/to/android-dev-qa/.venv/bin/python
+  args:
+    - /path/to/android-dev-qa/mcp_server.py
+  timeout: 120
 ```
 
-## 设计原则
+### 3. Environment Variables
 
-1. **事前规划** — 不是"看看有没有问题"，而是"比对预期和实际"
-2. **多维取证** — 截图（静态）+ 视频（动态）+ 日志（后台）三者关联
-3. **有据有节** — 基于证据报告问题，不凭空捏造，也不视而不见
-4. **通用适用** — 通过 test_plan.json 适配任意 Android 应用
+| Variable | Purpose | Default |
+|---|---|---|
+| `ADB_PATH` | Path to `adb` binary | Auto-discovered |
+| `ANDROID_HOME` | Android SDK root | Auto-discovered |
+| `QA_BACKEND` | Backend name (`adb`, future: `scrcpy`) | `adb` |
+| `WINDOWS_USER` | Windows username (WSL only) | Auto-detected |
+
+### 4. Connect & Use
+
+```
+qa_connect                → Auto-discover device
+qa_screenshot             → Capture screen
+qa_tap target="text:Settings"  → Tap by text
+qa_tap target="500,800"        → Tap by coordinates
+qa_type text="hello"           → Type text
+qa_scroll_find text="Submit"   → Scroll until found
+qa_run_test test_plan_path="plan.json"  → Run test suite
+```
+
+## Backends
+
+### ADB (default)
+
+Cross-platform ADB auto-discovery:
+- **WSL**: Searches `/mnt/c/Users/<user>/AppData/Local/Android/Sdk/`
+- **macOS**: `~/Library/Android/sdk/`
+- **Linux**: `/usr/bin/adb`, `~/.local/bin/adb`
+- **Windows**: `%LOCALAPPDATA%\Android\Sdk\`
+- **Fallback**: `ADB_PATH` env var or `PATH`
+
+Emulator type detection: AVD, Genymotion, BlueStacks, LDPlayer.
+
+### Adding a New Backend
+
+1. Create `scripts/backends/your_backend.py`
+2. Subclass `DeviceBackend` from `base.py`
+3. Implement all abstract methods
+4. Register in `backends/__init__.py`:
+   ```python
+   register_backend("your_backend", YourBackend)
+   ```
+5. Set `QA_BACKEND=your_backend`
+
+## AI Analysis (Optional)
+
+The `analysis/` module provides prompt templates and result merging for:
+- **Screenshot UI analysis** — layout, text, component issues
+- **Video interaction analysis** — animations, transitions, responsiveness
+- **Logcat stability analysis** — crashes, ANRs, OOMs
+
+AI calls are NOT made by the MCP server itself. Instead:
+1. `qa_run_test` generates an `analysis_manifest.json`
+2. The agent reads the manifest and calls its own vision/LLM tools
+3. Results are fed back through `AIAnalyzer.merge_results()`
+
+This keeps the MCP server agent-agnostic.
+
+## Test Plans
+
+See `templates/test_plan.json` for the full schema. Supported actions:
+
+| Action | Description |
+|---|---|
+| `launch` | Start app |
+| `tap` | Tap element |
+| `long_press` | Long press |
+| `double_tap` | Double tap |
+| `swipe` | Swipe direction |
+| `drag` | Drag between elements |
+| `type` | Input text (ASCII) |
+| `type_unicode` | Input Unicode (clipboard paste) |
+| `scroll_find` | Scroll until text found |
+| `element_state` | Verify element state |
+| `back` / `home` | Navigation keys |
+| `wait` | Delay |
+| `screenshot` | Capture + optional expect |
+
+## Changes from v0.1.0
+
+- **No global lock**: Tools run concurrently via asyncio executor
+- **Pluggable backends**: Swap ADB for Scrcpy/Appium without code changes
+- **Cross-platform ADB**: Auto-discovers on WSL/macOS/Linux/Windows
+- **Unified analysis**: `analyzer.py` + `ai_analysis.py` merged into `analysis/`
+- **Clipboard fix**: Multi-method fallback (am broadcast → service call → ADBKeyboard)
+- **Unicode input**: Clipboard + paste strategy for CJK on Android 14+
 
 ## License
 

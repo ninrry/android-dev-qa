@@ -1,26 +1,132 @@
 """
-device.py — ADB 设备管理模块
-负责设备发现、连接状态、模拟器生命周期管理
+device.py — Universal ADB device management
+Cross-platform ADB discovery, emulator detection, and device lifecycle management.
 """
-import subprocess
+from __future__ import annotations
+
+import logging
 import os
-import shlex
+import platform
 import re
+import shlex
+import shutil
+import subprocess
 import time
 from typing import Optional
-from dataclasses import dataclass
 
-# Windows 侧 ADB 路径（WSL 环境）
-ADB_PATHS = [
-    "/mnt/c/Users/d5u5ei/AppData/Local/Android/Sdk/platform-tools/adb.exe",
-    "/usr/bin/adb",
-    os.path.expanduser("~/.local/bin/adb"),
-]
+logger = logging.getLogger("android-qa.device")
 
-ANDROID_CLI_PATHS = [
-    os.path.expanduser("~/.local/bin/android"),
-    "/usr/local/bin/android",
-]
+# ── ADB Discovery ─────────────────────────────────────────────────────────────
+
+_SYSTEM = platform.system()  # "Linux", "Darwin", "Windows"
+_IS_WSL = "microsoft" in platform.uname().release.lower() if _SYSTEM == "Linux" else False
+
+
+def _adb_search_paths() -> list[str]:
+    """Build platform-aware ADB candidate paths."""
+    paths: list[str] = []
+
+    # 1. Environment variables (highest priority)
+    if v := os.environ.get("ADB_PATH", ""):
+        paths.append(v)
+    if v := os.environ.get("ANDROID_HOME", ""):
+        paths.append(os.path.join(v, "platform-tools", "adb" + (".exe" if _SYSTEM == "Windows" or _IS_WSL else "")))
+    if v := os.environ.get("ANDROID_SDK_ROOT", ""):
+        paths.append(os.path.join(v, "platform-tools", "adb" + (".exe" if _SYSTEM == "Windows" or _IS_WSL else "")))
+
+    # 2. WSL → Windows SDK
+    if _IS_WSL:
+        win_user = os.environ.get("WINDOWS_USER", "")
+        if not win_user:
+            # Try to discover Windows username from /mnt/c/Users/
+            try:
+                for entry in os.listdir("/mnt/c/Users/"):
+                    if entry not in ("Public", "Default", "Default User", "All Users",
+                                     "desktop.ini", "AppData") \
+                            and os.path.isdir(f"/mnt/c/Users/{entry}") \
+                            and os.path.exists(f"/mnt/c/Users/{entry}/AppData"):
+                        win_user = entry
+                        break
+            except OSError:
+                pass
+        if win_user:
+            paths.append(f"/mnt/c/Users/{win_user}/AppData/Local/Android/Sdk/platform-tools/adb.exe")
+
+    # 3. macOS
+    if _SYSTEM == "Darwin":
+        paths.append(os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"))
+
+    # 4. Linux standard paths
+    paths.extend([
+        "/usr/bin/adb",
+        "/usr/local/bin/adb",
+        os.path.expanduser("~/.local/bin/adb"),
+    ])
+
+    # 5. Windows native
+    if _SYSTEM == "Windows":
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        if local_app_data:
+            paths.append(os.path.join(local_app_data, "Android", "Sdk", "platform-tools", "adb.exe"))
+
+    # 6. shutil.which fallback
+    if found := shutil.which("adb"):
+        if found not in paths:
+            paths.append(found)
+
+    return [p for p in paths if p]  # filter empty
+
+
+def _find_adb() -> str:
+    """Find the first usable ADB binary."""
+    for path in _adb_search_paths():
+        if os.path.isfile(path) and os.access(path, os.X_OK if _SYSTEM != "Windows" else os.R_OK):
+            logger.debug("ADB found at: %s", path)
+            return path
+    # Last resort: bare "adb" in PATH
+    try:
+        subprocess.run(["adb", "version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
+        return "adb"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    raise FileNotFoundError(
+        "ADB not found. Install Android SDK platform-tools and/or set ADB_PATH / ANDROID_HOME."
+    )
+
+
+def _find_android_cli() -> Optional[str]:
+    """Find the android CLI (for emulator management)."""
+    candidates = [
+        os.environ.get("ANDROID_CLI_PATH", ""),
+        os.path.expanduser("~/.local/bin/android"),
+        "/usr/local/bin/android",
+    ]
+    if _IS_WSL:
+        win_user = os.environ.get("WINDOWS_USER", "")
+        if not win_user:
+            try:
+                for entry in os.listdir("/mnt/c/Users/"):
+                    if entry not in ("Public", "Default", "Default User", "All Users",
+                                     "desktop.ini", "AppData") \
+                            and os.path.isdir(f"/mnt/c/Users/{entry}") \
+                            and os.path.exists(f"/mnt/c/Users/{entry}/AppData"):
+                        win_user = entry
+                        break
+            except OSError:
+                pass
+        if win_user:
+            candidates.append(f"/mnt/c/Users/{win_user}/AppData/Local/Android/Sdk/cmdline-tools/latest/bin/android")
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    if found := shutil.which("android"):
+        return found
+    return None
+
+
+# ── Data Models ───────────────────────────────────────────────────────────────
+
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -30,202 +136,193 @@ class Device:
     model: str = ""
     api_level: str = ""
     is_emulator: bool = False
+    emulator_type: str = ""  # "avd", "genymotion", "bluestacks", "ldplayer", "unknown", ""
 
     @property
     def ready(self) -> bool:
         return self.state == "device"
 
 
+# ── Emulator Detection ────────────────────────────────────────────────────────
+
+_EMULATOR_PATTERNS: dict[str, re.Pattern] = {
+    "avd": re.compile(r"emulator-\d+"),
+    "genymotion": re.compile(r"169\.254\.\d+\.\d+|vbox\d+"),
+    "bluestacks": re.compile(r"127\.0\.0\.1:\d+|bluestacks", re.IGNORECASE),
+    "ldplayer": re.compile(r"127\.0\.0\.1:\d+|ldplayer", re.IGNORECASE),
+}
+
+
+def _detect_emulator_type(serial: str) -> tuple[bool, str]:
+    """Detect emulator type from serial number."""
+    for etype, pattern in _EMULATOR_PATTERNS.items():
+        if pattern.search(serial):
+            return True, etype
+    # Common emulator port ranges (5554+, for AVD)
+    if re.match(r"emulator-\d+", serial):
+        return True, "avd"
+    if re.match(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+", serial):
+        return True, "unknown"  # TCP-connected, likely emulator
+    return False, ""
+
+
+# ── DeviceManager ─────────────────────────────────────────────────────────────
+
 class DeviceManager:
-    """ADB 设备管理器"""
+    """ADB device manager — cross-platform, auto-discovery."""
 
-    def __init__(self):
-        self._adb = self._find_adb()
-        self._android_cli = self._find_android_cli()
+    def __init__(self, adb_path: Optional[str] = None, android_cli: Optional[str] = None):
+        self._adb = adb_path or _find_adb()
+        self._android_cli = android_cli or _find_android_cli()
+        logger.info("ADB: %s | Android CLI: %s", self._adb, self._android_cli or "(not found)")
 
-    def _find_adb(self) -> str:
-        """查找可用的 adb 可执行文件"""
-        for path in ADB_PATHS:
-            if os.path.exists(path):
-                return path
-        # 尝试 PATH 中的 adb
-        try:
-            subprocess.run(["adb", "version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
-            return "adb"
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-        raise FileNotFoundError(
-            "ADB not found. Install Android SDK platform-tools or set ADB_PATH."
-        )
+    # ── Low-level ─────────────────────────────────────────────────────────
 
-    def _find_android_cli(self) -> Optional[str]:
-        """查找 android CLI"""
-        for path in ANDROID_CLI_PATHS:
-            if os.path.exists(path):
-                return path
-        return None
-
-    def _run(self, args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
-        """执行 adb 命令"""
-        cmd = [self._adb] + args
+    def _run(self, args: list[str], timeout: int = 30, serial: Optional[str] = None) -> subprocess.CompletedProcess:
+        cmd = [self._adb]
+        if serial:
+            cmd += ["-s", serial]
+        cmd += args
         return subprocess.run(
             cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL,
             encoding="utf-8", errors="replace",
         )
 
     def _run_android_cli(self, args: list[str], timeout: int = 30) -> Optional[subprocess.CompletedProcess]:
-        """执行 android CLI 命令"""
         if not self._android_cli:
             return None
-        cmd = [self._android_cli] + args
         return subprocess.run(
-            cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL,
-            encoding="utf-8", errors="replace",
+            [self._android_cli] + args, capture_output=True, timeout=timeout,
+            stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
         )
 
+    # ── Device Discovery ──────────────────────────────────────────────────
+
     def list_devices(self) -> list[Device]:
-        """列出所有已连接设备"""
         result = self._run(["devices", "-l"])
         devices = []
         for line in result.stdout.strip().split("\n")[1:]:
             if not line.strip():
                 continue
             parts = line.split()
-            if len(parts) >= 2:
-                serial = parts[0]
-                state = parts[1]
-                model = ""
-                for p in parts[2:]:
-                    if p.startswith("model:"):
-                        model = p.split(":", 1)[1]
-                is_emulator = "emulator" in serial or "169.254" in serial
-                devices.append(Device(
-                    serial=serial, state=state, model=model,
-                    is_emulator=is_emulator,
-                ))
+            if len(parts) < 2:
+                continue
+            serial = parts[0]
+            state = parts[1]
+            model = ""
+            for p in parts[2:]:
+                if p.startswith("model:"):
+                    model = p.split(":", 1)[1]
+            is_emu, emu_type = _detect_emulator_type(serial)
+            devices.append(Device(
+                serial=serial, state=state, model=model,
+                is_emulator=is_emu, emulator_type=emu_type,
+            ))
         return devices
 
     def get_ready_device(self) -> Optional[Device]:
-        """获取第一个就绪的设备"""
         for dev in self.list_devices():
             if dev.ready:
                 return dev
         return None
 
     def ensure_device(self) -> Device:
-        """确保有可用设备，否则报错"""
         dev = self.get_ready_device()
         if not dev:
             raise RuntimeError(
                 "No ready device found. Start an emulator or connect a device.\n"
-                f"  android emulator start --name <avd_name>\n"
-                f"  adb devices"
+                "  android emulator start --name <avd_name>\n"
+                "  adb devices"
             )
         return dev
 
+    # ── Device Info ───────────────────────────────────────────────────────
+
     def get_device_info(self, serial: Optional[str] = None) -> dict:
-        """获取设备详细信息"""
-        args = []
-        if serial:
-            args = ["-s", serial]
+        info: dict = {}
+        for prop, key in [
+            ("ro.build.version.sdk", "api_level"),
+            ("ro.build.version.release", "android_version"),
+            ("ro.product.model", "model"),
+        ]:
+            r = self._run(["shell", "getprop", prop], serial=serial)
+            info[key] = r.stdout.strip()
 
-        info = {}
-        # API level
-        r = self._run(args + ["shell", "getprop", "ro.build.version.sdk"])
-        info["api_level"] = r.stdout.strip()
-
-        # Android version
-        r = self._run(args + ["shell", "getprop", "ro.build.version.release"])
-        info["android_version"] = r.stdout.strip()
-
-        # Screen resolution
-        r = self._run(args + ["shell", "wm", "size"])
+        r = self._run(["shell", "wm", "size"], serial=serial)
         info["screen_size"] = r.stdout.strip().split(":")[-1].strip() if ":" in r.stdout else ""
 
-        # Screen density
-        r = self._run(args + ["shell", "wm", "density"])
+        r = self._run(["shell", "wm", "density"], serial=serial)
         info["density"] = r.stdout.strip().split(":")[-1].strip() if ":" in r.stdout else ""
-
-        # Model
-        r = self._run(args + ["shell", "getprop", "ro.product.model"])
-        info["model"] = r.stdout.strip()
 
         return info
 
+    def get_screen_size(self, serial: Optional[str] = None) -> tuple[int, int]:
+        """Get screen width x height as ints."""
+        info = self.get_device_info(serial)
+        raw = info.get("screen_size", "")
+        try:
+            w, h = raw.split("x")
+            return int(w), int(h)
+        except (ValueError, AttributeError):
+            return 1080, 1920  # safe default
+
+    # ── Emulator Management ───────────────────────────────────────────────
+
     def start_emulator(self, avd_name: str, wait_timeout: int = 120) -> Device:
-        """启动模拟器并等待就绪"""
-        # 使用 android CLI 启动
-        result = self._run_android_cli(
-            ["emulator", "start", "--name", avd_name],
-            timeout=wait_timeout,
-        )
+        result = self._run_android_cli(["emulator", "start", "--name", avd_name], timeout=wait_timeout)
         if result and result.returncode != 0:
             raise RuntimeError(f"Failed to start emulator: {result.stderr}")
-
-        # 等待设备就绪
         start = time.time()
         while time.time() - start < wait_timeout:
             dev = self.get_ready_device()
             if dev:
-                # 额外等待 boot 完成
-                self._run(["-s", dev.serial, "shell", "wait-for-device"])
-                self._run(["-s", dev.serial, "shell", "getprop", "sys.boot_completed"], timeout=30)
+                self._run(["shell", "wait-for-device"], serial=dev.serial)
+                self._run(["shell", "getprop", "sys.boot_completed"], serial=dev.serial, timeout=30)
                 return dev
             time.sleep(3)
-
         raise TimeoutError(f"Emulator did not become ready within {wait_timeout}s")
 
     def stop_emulator(self, serial: Optional[str] = None) -> None:
-        """停止模拟器"""
         dev = Device(serial=serial, state="device") if serial else self.get_ready_device()
         if dev:
-            self._run(["-s", dev.serial, "emu", "kill"])
+            self._run(["emu", "kill"], serial=dev.serial)
 
     def list_avds(self) -> list[str]:
-        """列出所有可用的 AVD"""
         result = self._run_android_cli(["emulator", "list"])
         if not result:
-            # fallback: 用 emulator -list-avds
             result = self._run(["emulator", "-list-avds"])
             return [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
         avds = []
         for line in result.stdout.strip().split("\n"):
             line = line.strip()
-            if line and not line.startswith("Available") and not line.startswith("Name"):
+            if line and not line.startswith(("Available", "Name")):
                 avds.append(line.split()[0] if line.split() else line)
         return avds
 
+    # ── App Lifecycle ─────────────────────────────────────────────────────
+
     def install_apk(self, apk_path: str, serial: Optional[str] = None) -> bool:
-        """安装 APK 到设备"""
-        args = ["install", "-r", apk_path]
-        if serial:
-            args = ["-s", serial] + args
-        result = self._run(args, timeout=120)
+        result = self._run(["install", "-r", apk_path], timeout=120, serial=serial)
         return result.returncode == 0 and "Success" in result.stdout
 
     def launch_app(self, package: str, activity: str = "", serial: Optional[str] = None) -> bool:
-        """启动应用"""
-        # 如果没有指定 activity，先自动查询 launcher activity
         if not activity:
             activity = self._find_launcher_activity(package, serial)
         if activity:
-            target = f"{package}/{activity}"
-            args = ["shell", "am", "start", "-n", target]
+            args = ["shell", "am", "start", "-n", f"{package}/{activity}"]
         else:
-            # fallback: 用 monkey 启动（最可靠）
             args = ["shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"]
-        if serial:
-            args = ["-s", serial] + args
-        result = self._run(args)
+        result = self._run(args, serial=serial)
         return result.returncode == 0
+
     def _find_launcher_activity(self, package: str, serial: Optional[str] = None) -> Optional[str]:
-        """自动查询应用的 launcher activity"""
-        args = ["shell", "cmd", "package", "resolve-activity", "--brief", "-c", "android.intent.category.LAUNCHER", package]
-        if serial:
-            args = ["-s", serial] + args
-        result = self._run(args, timeout=10)
-        if result.returncode == 0 and result.stdout.strip():
-            for line in result.stdout.strip().split("\n"):
+        r = self._run(
+            ["shell", "cmd", "package", "resolve-activity", "--brief",
+             "-c", "android.intent.category.LAUNCHER", package],
+            timeout=10, serial=serial,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            for line in r.stdout.strip().split("\n"):
                 line = line.strip()
                 if "/" in line and package in line:
                     component = line.split("component=")[-1].strip() if "component=" in line else line
@@ -233,227 +330,219 @@ class DeviceManager:
                         return component.split("/", 1)[1]
         return None
 
+    # ── Input Operations ──────────────────────────────────────────────────
+
     def tap(self, x: int, y: int, serial: Optional[str] = None) -> None:
-        """点击屏幕坐标"""
-        args = ["shell", "input", "tap", str(x), str(y)]
-        if serial:
-            args = ["-s", serial] + args
-        self._run(args)
+        self._run(["shell", "input", "tap", str(x), str(y)], serial=serial)
 
-    def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300, serial: Optional[str] = None) -> None:
-        """滑动操作"""
-        args = ["shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration_ms)]
-        if serial:
-            args = ["-s", serial] + args
-        self._run(args)
+    def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300,
+              serial: Optional[str] = None) -> None:
+        self._run(["shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration_ms)],
+                  serial=serial)
 
-    def text(self, content: str, serial: Optional[str] = None) -> None:
-        """输入文本"""
-        args = ["shell", "input", "text", content]
-        if serial:
-            args = ["-s", serial] + args
-        self._run(args)
+    def text_input(self, content: str, serial: Optional[str] = None) -> None:
+        """Input ASCII text via `adb shell input text`."""
+        self._run(["shell", "input", "text", content], serial=serial)
 
     def keyevent(self, keycode: str, serial: Optional[str] = None) -> None:
-        """发送按键事件"""
-        args = ["shell", "input", "keyevent", keycode]
-        if serial:
-            args = ["-s", serial] + args
-        self._run(args)
+        self._run(["shell", "input", "keyevent", keycode], serial=serial)
 
     def back(self, serial: Optional[str] = None) -> None:
-        """按返回键"""
         self.keyevent("KEYCODE_BACK", serial)
 
     def home(self, serial: Optional[str] = None) -> None:
-        """按 Home 键"""
         self.keyevent("KEYCODE_HOME", serial)
 
-    # ── 剪贴板操作 ──────────────────────────────────────────────
+    # ── Clipboard ─────────────────────────────────────────────────────────
 
-    def clipboard_set(self, text: str, serial: Optional[str] = None) -> None:
-        """通过 am broadcast 设置剪贴板文本（兼容 Android 10+）"""
-        # Method 1: service call clipboard (Android 10-12)
-        escaped = text.replace('"', '\\"')
-        args_base = ["-s", serial] if serial else []
-        # Try service call first
-        self._run(args_base + ["shell", "service", "call", "clipboard", "2", "i32", "1",
-                              "s16", escaped])
+    def clipboard_set(self, text: str, serial: Optional[str] = None) -> dict:
+        """Set clipboard text. Returns {ok, method, error?}.
+
+        Tries multiple methods in order:
+        1. am broadcast (Android 10+, most reliable)
+        2. service call clipboard (Android 10-13)
+        3. ADBKeyboard broadcast (if installed)
+        """
+        # Method 1: am broadcast — works on most Android versions
+        escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("'", "\\'")
+        r = self._run(
+            ["shell", "am", "broadcast", "-a", "com.android.intent.action.SET_CLIPBOARD",
+             "--es", "text", escaped],
+            timeout=5, serial=serial,
+        )
+        if r.returncode == 0 and "result=0" in r.stdout:
+            return {"ok": True, "method": "am_broadcast"}
+
+        # Method 2: service call clipboard
+        r2 = self._run(
+            ["shell", "service", "call", "clipboard", "2", "i32", "1", "s16", escaped],
+            timeout=5, serial=serial,
+        )
+        if r2.returncode == 0:
+            return {"ok": True, "method": "service_call"}
+
+        # Method 3: ADBKeyboard
+        r3 = self._run(
+            ["shell", "am", "broadcast", "-a", "com.android.adbkeyboard.SET_CLIPBOARD",
+             "--es", "text", escaped],
+            timeout=5, serial=serial,
+        )
+        if r3.returncode == 0 and "result=0" in r3.stdout:
+            return {"ok": True, "method": "adbkeyboard"}
+
+        return {"ok": False, "error": "All clipboard methods failed (am broadcast + service call + ADBKeyboard)"}
 
     def clipboard_get(self, serial: Optional[str] = None) -> str:
-        """读取剪贴板内容"""
-        args_base = ["-s", serial] if serial else []
-        result = self._run(args_base + ["shell", "service", "call", "clipboard", "1", "i32", "1"], timeout=5)
-        return result.stdout.strip() if result.returncode == 0 else ""
+        """Read clipboard content (best-effort)."""
+        r = self._run(["shell", "service", "call", "clipboard", "1", "i32", "1"], timeout=5, serial=serial)
+        if r.returncode == 0:
+            return r.stdout.strip()
+        return ""
 
-    def input_text_unicode(self, text: str, serial: Optional[str] = None) -> None:
-        """输入文本。ASCII 用 input text，CJK 暂不支持（Android 16 限制）"""
-        args_base = ["-s", serial] if serial else []
+    # ── Unicode Input ─────────────────────────────────────────────────────
+
+    def input_text_unicode(self, text: str, serial: Optional[str] = None) -> dict:
+        """Input text with Unicode support. Returns {ok, method, error?}.
+
+        Strategy:
+        1. ASCII-only → `adb shell input text`
+        2. Unicode → set clipboard + paste (CTRL+V)
+        """
+        args_base_serial = serial
         # Clear existing text: CTRL+A → DEL
-        self._run(args_base + ["shell", "input", "keyevent", "KEYCODE_CTRL_LEFT", "KEYCODE_A"])
-        time.sleep(0.1)
-        self._run(args_base + ["shell", "input", "keyevent", "KEYCODE_DEL"])
-        # Input text (ASCII only on Android 16+)
-        if all(ord(c) < 128 for c in text):
-            self._run(args_base + ["shell", "input", "text", text], timeout=10)
-        else:
-            # CJK: ADBKeyboard broadcasts don't work on Android 14+
-            # Log warning and attempt best-effort
-            logging.warning("CJK input not supported on Android 14+. Use ASCII or manual input.")
+        self._run(["shell", "input", "keyevent", "KEYCODE_CTRL_LEFT", "KEYCODE_A"], serial=serial)
+        time.sleep(0.05)
+        self._run(["shell", "input", "keyevent", "KEYCODE_DEL"], serial=serial)
+        time.sleep(0.05)
 
-    # ── 拖拽 & 双击 ────────────────────────────────────────────
+        if all(ord(c) < 128 for c in text):
+            self._run(["shell", "input", "text", text], timeout=10, serial=serial)
+            return {"ok": True, "method": "input_text"}
+
+        # Unicode: clipboard + paste
+        clip_result = self.clipboard_set(text, serial=serial)
+        if clip_result.get("ok"):
+            time.sleep(0.1)
+            self._run(["shell", "input", "keyevent", "KEYCODE_CTRL_LEFT", "KEYCODE_V"], serial=serial)
+            time.sleep(0.1)
+            return {"ok": True, "method": f"clipboard_paste({clip_result['method']})"}
+
+        return {"ok": False, "error": "Unicode input failed: clipboard set failed", "detail": clip_result}
+
+    # ── Drag & Double-tap ─────────────────────────────────────────────────
 
     def drag(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 500,
              serial: Optional[str] = None) -> None:
-        """拖拽操作"""
-        args = ["shell", "input", "draganddrop", str(x1), str(y1), str(x2), str(y2), str(duration_ms)]
-        if serial:
-            args = ["-s", serial] + args
-        self._run(args, timeout=10)
+        # Android 8+ supports draganddrop, fallback to swipe
+        r = self._run(["shell", "input", "draganddrop", str(x1), str(y1), str(x2), str(y2), str(duration_ms)],
+                      timeout=10, serial=serial)
+        if r.returncode != 0:
+            # Fallback: swipe (works on all versions)
+            self.swipe(x1, y1, x2, y2, duration_ms, serial=serial)
 
     def double_tap(self, x: int, y: int, serial: Optional[str] = None) -> None:
-        """双击"""
-        args_base = ["-s", serial] if serial else []
-        self._run(args_base + ["shell", "input", "tap", str(x), str(y)])
+        self._run(["shell", "input", "tap", str(x), str(y)], serial=serial)
         time.sleep(0.1)
-        self._run(args_base + ["shell", "input", "tap", str(x), str(y)])
+        self._run(["shell", "input", "tap", str(x), str(y)], serial=serial)
 
-    # ── 通知栏 ──────────────────────────────────────────────────
+    # ── Notifications ─────────────────────────────────────────────────────
 
     def notifications_expand(self, serial: Optional[str] = None) -> None:
-        """展开通知栏"""
-        args = ["shell", "cmd", "statusbar", "expand-notifications"]
-        if serial:
-            args = ["-s", serial] + args
-        self._run(args)
+        self._run(["shell", "cmd", "statusbar", "expand-notifications"], serial=serial)
 
     def notifications_collapse(self, serial: Optional[str] = None) -> None:
-        """收起通知栏"""
-        args = ["shell", "cmd", "statusbar", "collapse"]
-        if serial:
-            args = ["-s", serial] + args
-        self._run(args)
+        self._run(["shell", "cmd", "statusbar", "collapse"], serial=serial)
 
-    # ── Shell 命令 ──────────────────────────────────────────────
+    # ── Shell ─────────────────────────────────────────────────────────────
 
     def run_shell(self, command: str, serial: Optional[str] = None, timeout: int = 30) -> dict:
-        """执行任意 shell 命令"""
         args = ["shell"] + shlex.split(command)
-        if serial:
-            args = ["-s", serial] + args
-        result = self._run(args, timeout=timeout)
+        result = self._run(args, timeout=timeout, serial=serial)
         return {"stdout": result.stdout.strip(), "returncode": result.returncode}
 
-    # ── 性能测量 ────────────────────────────────────────────────
+    # ── Performance ───────────────────────────────────────────────────────
 
     def measure_startup(self, package: str, serial: Optional[str] = None) -> dict:
-        """测量应用冷启动时间（am start -W）"""
-        import re as _re
-        args_base = ["-s", serial] if serial else []
-        # 先查询 launcher activity
-        activity = None
-        r = self._run(args_base + ["shell", "cmd", "package", "resolve-activity", "--brief",
-                                   "-c", "android.intent.category.LAUNCHER", package], timeout=10)
-        for line in r.stdout.split("\n"):
-            if "/" in line and package in line:
-                comp = line.strip()
-                if "component=" in comp:
-                    comp = comp.split("component=")[-1].strip()
-                if "/" in comp:
-                    activity = comp.split("/", 1)[1]
-                    break
-        # force-stop for cold start
-        self._run(args_base + ["shell", "am", "force-stop", package])
+        activity = self._find_launcher_activity(package, serial)
+        self._run(["shell", "am", "force-stop", package], serial=serial)
         time.sleep(1)
-        # launch with timing
         if activity:
-            target = f"{package}/{activity}"
-            result = self._run(args_base + ["shell", "am", "start", "-W", "-n", target], timeout=30)
+            result = self._run(["shell", "am", "start", "-W", "-n", f"{package}/{activity}"], timeout=30, serial=serial)
         else:
-            result = self._run(args_base + ["shell", "am", "start", "-W", package], timeout=30)
-        # Normalize \r\n → \n
+            result = self._run(["shell", "am", "start", "-W", package], timeout=30, serial=serial)
         output = result.stdout.replace("\r\n", "\n").replace("\r", "\n")
-        timing = {}
+        timing: dict = {}
         for line in output.split("\n"):
             line = line.strip()
-            if "TotalTime" in line:
-                try: timing["total_time_ms"] = int(line.split(":")[-1].strip())
-                except: pass
-            elif "WaitTime" in line:
-                try: timing["wait_time_ms"] = int(line.split(":")[-1].strip())
-                except: pass
-            elif "ThisTime" in line:
-                try: timing["this_time_ms"] = int(line.split(":")[-1].strip())
-                except: pass
-            elif line.startswith("Status:"):
+            for key, label in [("total_time_ms", "TotalTime"), ("wait_time_ms", "WaitTime"), ("this_time_ms", "ThisTime")]:
+                if label in line:
+                    try:
+                        timing[key] = int(line.split(":")[-1].strip())
+                    except ValueError:
+                        pass
+            if line.startswith("Status:"):
                 timing["status"] = line.split(":")[-1].strip()
         return timing
 
     def dump_meminfo(self, package: str, serial: Optional[str] = None) -> dict:
-        """获取应用内存信息"""
-        args_base = ["-s", serial] if serial else []
-        result = self._run(args_base + ["shell", "dumpsys", "meminfo", package], timeout=10)
+        result = self._run(["shell", "dumpsys", "meminfo", package], timeout=10, serial=serial)
         output = result.stdout.replace("\r\n", "\n").replace("\r", "\n")
-        info = {}
+        info: dict = {}
         for line in output.split("\n"):
             line = line.strip()
             if "TOTAL PSS:" in line:
-                # Format: "TOTAL PSS:    39595            TOTAL RSS:   159744"
+                parts = line.split()
                 try:
-                    parts = line.split()
-                    pss_idx = parts.index("PSS:") + 1
-                    info["total_pss_kb"] = int(parts[pss_idx])
-                except: pass
+                    info["total_pss_kb"] = int(parts[parts.index("PSS:") + 1])
+                except (ValueError, IndexError):
+                    pass
                 try:
-                    rss_idx = parts.index("RSS:") + 1
-                    info["total_rss_kb"] = int(parts[rss_idx])
-                except: pass
-            elif line.startswith("TOTAL") and not "TOTAL PSS" in line:
-                # Format: "TOTAL    39595    27628     8000 ..."
-                try:
-                    parts = line.split()
-                    if len(parts) >= 2:
+                    info["total_rss_kb"] = int(parts[parts.index("RSS:") + 1])
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith("TOTAL") and "TOTAL PSS" not in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
                         info["total_pss_kb"] = int(parts[1])
-                except: pass
+                    except ValueError:
+                        pass
         return info
 
     def dump_gfxinfo(self, package: str, serial: Optional[str] = None) -> dict:
-        """获取应用帧渲染信息"""
-        args_base = ["-s", serial] if serial else []
-        result = self._run(args_base + ["shell", "dumpsys", "gfxinfo", package], timeout=10)
+        result = self._run(["shell", "dumpsys", "gfxinfo", package], timeout=10, serial=serial)
         output = result.stdout.replace("\r\n", "\n").replace("\r", "\n")
-        info = {"total_frames": 0, "janky_frames": 0, "percentile_50": 0, "percentile_90": 0}
+        info: dict = {"total_frames": 0, "janky_frames": 0, "percentile_50": 0, "percentile_90": 0}
         for line in output.split("\n"):
             line = line.strip()
             if "Total frames rendered:" in line:
-                try: info["total_frames"] = int(line.split(":")[-1].strip())
-                except: pass
+                try:
+                    info["total_frames"] = int(line.split(":")[-1].strip())
+                except ValueError:
+                    pass
             elif line.startswith("Janky frames:") and "legacy" not in line:
-                # Format: "Janky frames: 5 (35.71%)"
-                try: info["janky_frames"] = int(line.split(":")[-1].strip().split()[0])
-                except: pass
+                try:
+                    info["janky_frames"] = int(line.split(":")[-1].strip().split()[0])
+                except ValueError:
+                    pass
             elif "50th percentile:" in line and "gpu" not in line:
-                try: info["percentile_50"] = int(line.split(":")[-1].strip().replace("ms", ""))
-                except: pass
+                try:
+                    info["percentile_50"] = int(line.split(":")[-1].strip().replace("ms", ""))
+                except ValueError:
+                    pass
             elif "90th percentile:" in line and "gpu" not in line:
-                try: info["percentile_90"] = int(line.split(":")[-1].strip().replace("ms", ""))
-                except: pass
+                try:
+                    info["percentile_90"] = int(line.split(":")[-1].strip().replace("ms", ""))
+                except ValueError:
+                    pass
         return info
 
-    # ── 文件传输 ────────────────────────────────────────────────
+    # ── File Transfer ─────────────────────────────────────────────────────
 
     def push_file(self, local_path: str, device_path: str, serial: Optional[str] = None) -> bool:
-        """推送文件到设备"""
-        args = ["push", local_path, device_path]
-        if serial:
-            args = ["-s", serial] + args
-        result = self._run(args, timeout=120)
+        result = self._run(["push", local_path, device_path], timeout=120, serial=serial)
         return result.returncode == 0
 
     def pull_file(self, device_path: str, local_path: str, serial: Optional[str] = None) -> bool:
-        """从设备拉取文件"""
-        args = ["pull", device_path, local_path]
-        if serial:
-            args = ["-s", serial] + args
-        result = self._run(args, timeout=120)
+        result = self._run(["pull", device_path, local_path], timeout=120, serial=serial)
         return result.returncode == 0
